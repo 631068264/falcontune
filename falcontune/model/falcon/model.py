@@ -4,6 +4,8 @@ import importlib
 from typing import Optional, Tuple, Union
 
 import torch
+print(torch.cuda.is_available())  # 打印GPU信息
+print(torch.cuda.device_count())  # 可用个数
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss

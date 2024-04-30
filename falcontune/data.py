@@ -1,3 +1,4 @@
+import copy
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
@@ -5,12 +6,15 @@ import torch
 from datasets import Dataset, load_dataset
 from transformers.utils import logging
 
+from falcontune.model.falcon.config import MODEL_MAX_SEQ_LEN
+
 logger = logging.get_logger("transformers")
 
 
 class TrainDataBase(ABC):
     """
     """
+
     @abstractmethod
     def __init__(self, dataset: str, val_set_size: int, tokenizer, cutoff_len: int) -> None:
         """
@@ -51,7 +55,8 @@ class TrainGPT4All(TrainDataBase):
 
         out = {"labels": [], "attention_mask": []}
         for i, (prompt, response) in enumerate(zip(examples["prompt"], examples["response"])):
-            input_tokens = self.tokenizer(prompt, truncation=True, max_length=max_length // 2, return_tensors="pt")["input_ids"].squeeze()
+            input_tokens = self.tokenizer(prompt, truncation=True, max_length=max_length // 2, return_tensors="pt")[
+                "input_ids"].squeeze()
             if input_tokens.dim() == 0:
                 input_tokens = input_tokens.unsqueeze(0)
 
@@ -61,7 +66,8 @@ class TrainGPT4All(TrainDataBase):
             # but we subtract one since we want to add eos token
             remaining_tokens = max_length - input_len - len(newline_tokens) + 1
             # remove bos
-            target_tokens = self.tokenizer(response, truncation=True, max_length=remaining_tokens, return_tensors="pt")["input_ids"].squeeze()[1:]
+            target_tokens = self.tokenizer(response, truncation=True, max_length=remaining_tokens, return_tensors="pt")[
+                                "input_ids"].squeeze()[1:]
 
             input_ids[i, :input_len] = input_tokens
             # add newline between prompt and response
@@ -134,8 +140,8 @@ class TrainSAD(TrainDataBase):
                 padding=False,
             )
             if (
-                result["input_ids"][-1] != self.tokenizer.eos_token_id
-                and len(result["input_ids"]) < self.cutoff_len
+                    result["input_ids"][-1] != self.tokenizer.eos_token_id
+                    and len(result["input_ids"]) < self.cutoff_len
             ):
                 result["input_ids"].append(self.tokenizer.eos_token_id)
                 result["attention_mask"].append(1)
@@ -153,14 +159,17 @@ class TrainSAD(TrainDataBase):
             }
 
     def prepare_data(self, use_eos_token=True, **kwargs) -> None:
-        data = load_dataset("json", data_files=self.dataset)
+        data = load_dataset("json", data_dir=self.dataset)
 
         if self.val_set_size > 0:
             train_val = data["train"].train_test_split(test_size=self.val_set_size, shuffle=True, seed=42)
-            self.train_data = train_val["train"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
-            self.val_data = train_val["test"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
+            self.train_data = train_val["train"].shuffle().map(
+                lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
+            self.val_data = train_val["test"].shuffle().map(
+                lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
         else:
-            self.train_data = data["train"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
+            self.train_data = data["train"].shuffle().map(
+                lambda x: self.generate_and_tokenize_prompt(x, use_eos_token=use_eos_token))
             self.val_data = None
 
     # Auxiliary methods
@@ -174,6 +183,62 @@ class TrainSAD(TrainDataBase):
     def generate_and_tokenize_prompt(self, data_point, **kwargs):
         prompt = self.generate_prompt(data_point, **kwargs)
         return self.tokenize(prompt, **kwargs)
+
+
+class TrainMultiturn(TrainDataBase):
+    IGNORE_INDEX = -100
+
+    def __init__(self, dataset: str, val_set_size: int, tokenizer, cutoff_len) -> None:
+        super().__init__(dataset, val_set_size, tokenizer, cutoff_len)
+
+    def tokenize(self, prompt: str) -> Dict[str, Any]:
+        pass
+
+    def prepare_data(self, **kwargs) -> None:
+        """Loads dataset from file and prepares train_data for trainer."""
+        dataset = load_dataset("json", data_dir=self.dataset)
+        if self.val_set_size > 0:
+            train_val = dataset["train"].train_test_split(test_size=self.val_set_size, shuffle=True, seed=42)
+            self.train_data = train_val["train"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x))
+            self.val_data = train_val["test"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x))
+        else:
+            self.train_data = dataset["train"].shuffle().map(lambda x: self.generate_and_tokenize_prompt(x))
+            self.val_data = None
+
+    def generate_and_tokenize_prompt(self, data_point):
+        input_ids = []
+        labels = []
+        source = data_point["conversations"]
+        for sentence in source:
+            sentence_from = sentence["from"].lower()
+            sentence_value = 'Human: \n' + sentence["value"] + '\n\nAssistant: \n' if sentence_from == 'human' else \
+                sentence["value"]  # https://github.com/LianjiaTech/BELLE/issues/337
+            # conversation += sentence_value
+            # do not add bos_token_id
+            sentence_ids = self.tokenizer.encode(
+                sentence_value, padding='max_length', truncation=True, max_length=self.cutoff_len + 1,
+                add_special_tokens=False)
+            label = copy.deepcopy(sentence_ids) if sentence_from != 'human' else [self.IGNORE_INDEX] * len(sentence_ids)
+            input_ids += sentence_ids
+            labels += label
+            # add eos at every end of assistant sentence
+            if sentence_from != 'human':
+                input_ids += [self.tokenizer.eos_token_id]  # make sure eos_token_id is correct
+                labels += [self.tokenizer.eos_token_id]
+
+        input_ids = input_ids[:MODEL_MAX_SEQ_LEN - 1]
+        labels = labels[:MODEL_MAX_SEQ_LEN - 1]
+        if not any(x > -100 for x in labels):
+            labels[18:24] = input_ids[
+                            18:24]  # labels can not have all values being -100. 18 and 24 are just random numbers
+
+        attention_mask = [1] * len(input_ids)
+        tokenized_full_prompt = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+        return tokenized_full_prompt
 
 
 def make_prompt(instruction, input_, output=""):
@@ -202,6 +267,13 @@ def load_data(config, tokenizer):
             config.val_set_size,
             tokenizer,
             config.cutoff_len)
+    elif config.data_type == "multiturn":
+        data = TrainMultiturn(
+            config.dataset,
+            config.val_set_size,
+            tokenizer,
+            config.cutoff_len)
+
 
     else:
         raise ValueError(f"Invalid data name: {config.data_type}")
@@ -213,4 +285,5 @@ def load_data(config, tokenizer):
 DATA_TYPES = [
     "alpaca",
     "gpt4all",
+    "multiturn",
 ]
